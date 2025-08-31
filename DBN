@@ -1,0 +1,508 @@
+import pandas as pd
+import numpy as np
+
+# CAS official CAV adoption rates (%)
+data = {
+    "Year": [2025, 2030, 2035, 2040, 2045, 2050, 2055, 2060],
+    "Adoption": [0.00, 4.55, 9.09, 22.00, 41.67, 65.00, 82.50, 91.50]
+}
+df = pd.DataFrame(data)
+df["Adoption_frac"] = df["Adoption"] / 100
+
+# Functions
+def bounded_decay(A, M0, Mmin, p):
+    """Decrease with adoption but with floor value"""
+    return Mmin + (M0 - Mmin) * (1 - A)**p
+
+def bounded_growth(A, M0, Mmax, q):
+    """Increase with adoption but with ceiling value"""
+    return Mmax - (Mmax - M0) * (1 - A)**q
+
+def tech_improvement_exp(year, M0, Mmax, k):
+    """Exponential improvement independent of adoption"""
+    return Mmax - (Mmax - M0) * np.exp(-k * (year - 2025))
+
+def error_rate(year, base_ratio, target_ratio, steps):
+    """Improves multiplicatively to target"""
+    ratios = []
+    for y in year:
+        if y == 2025:
+            ratios.append(base_ratio)
+        else:
+            years_passed = y - 2025
+            improvement_steps = years_passed / steps
+            improved = min(target_ratio, base_ratio * (5 ** improvement_steps))
+            ratios.append(improved)
+    return ratios
+
+df["Collisions_human_error"] = bounded_decay(df["Adoption_frac"], 80, 2, 1.05)
+df["GB_collisions_human_error"] = bounded_decay(df["Adoption_frac"], 88, 3, 1.05)
+df["Economic_share"] = bounded_growth(df["Adoption_frac"], 0, 50.9, 1.05)
+
+df["Coverage_total"] = tech_improvement_exp(df["Year"], 66, 99, 0.12)
+df["Coverage_urban"] = tech_improvement_exp(df["Year"], 84, 99, 0.15)
+df["Coverage_rural"] = tech_improvement_exp(df["Year"], 57, 99, 0.10)
+
+df["Rear_end_crash_reduction"] = tech_improvement_exp(df["Year"], 38, 95, 0.10)
+df["Error_rate"] = error_rate(df["Year"], 1/10000, 1/1000000, 5)  # stored as fractions
+
+df["Awareness"] = bounded_growth(df["Adoption_frac"], 84, 99.5, 0.6)
+df["Experience_understanding"] = bounded_growth(df["Adoption_frac"], 49, 98, 0.9)
+df["Investment_international"] = bounded_growth(df["Adoption_frac"], 67, 95, 0.7)
+
+df["Public_concern"] = bounded_decay(df["Adoption_frac"], 83, 5, 1.2)
+df["Congestion_reduction"] = bounded_growth(df["Adoption_frac"], 20, 60, 0.8)
+
+# GHG reductions as ranges
+ghg_min = bounded_growth(df["Adoption_frac"], 7, 24, 0.85)
+ghg_max = bounded_growth(df["Adoption_frac"], 16, 38, 0.85)
+df["GHG_overall"] = [f"{round(lo,1)}–{round(hi,1)}" for lo, hi in zip(ghg_min, ghg_max)]
+
+ghg_rh_min = bounded_growth(df["Adoption_frac"], 30, 45, 0.85)
+ghg_rh_max = bounded_growth(df["Adoption_frac"], 35, 54, 0.85)
+df["GHG_ride_hailing"] = [f"{round(lo,1)}–{round(hi,1)}" for lo, hi in zip(ghg_rh_min, ghg_rh_max)]
+
+df["Error_rate"] = [f"1:{int(1/x):,}" for x in df["Error_rate"]]
+
+# Final selection & rounding
+cols = [
+    "Year", "Adoption", "Collisions_human_error", "GB_collisions_human_error",
+    "Economic_share", "Coverage_total", "Coverage_urban", "Coverage_rural",
+    "Rear_end_crash_reduction", "Error_rate", "Awareness", "Experience_understanding",
+    "Investment_international", "Public_concern", "Congestion_reduction",
+    "GHG_overall", "GHG_ride_hailing"
+]
+
+df_final = df[cols].round(1)
+
+df_transposed = df_final.set_index("Year").T
+
+df_transposed.to_excel("CAV_adoption_metrics_transposed.xlsx")
+
+print("Excel file 'CAV_adoption_metrics_transposed.xlsx' created successfully!")
+
+# Dynamic Bayesian Network
+------------------------------------------------------------
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from itertools import product
+from pathlib import Path
+
+# pgmpy
+from pgmpy.models import DynamicBayesianNetwork as DBN
+from pgmpy.factors.discrete import TabularCPD
+from pgmpy.inference import DBNInference
+
+# <<< NEW: percentile legend imports
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+# -----------------------------------------------------------
+TARGET_THRESHOLD = 80          # % adoption considered "High"
+POLICY_STRENGTHS = ["mild", "moderate", "strong"]
+ALPHA = 3.0                    # overall weight scale (logistic coefficients)
+W_PREV = 0.5                   # dependence on previous adoption state
+PHI = 200.0                    # beta prior concentration for CPD sampling
+N_SIMS = 2000                  # Monte Carlo posterior-predictive draws
+
+OUT_DIR = Path("cav_results")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ------------------------------ Utils ------------------------------
+def logit(p: float) -> float:
+    p = float(min(max(p, 1e-9), 1 - 1e-9))
+    return math.log(p / (1 - p))
+
+def sigmoid(z: float) -> float:
+    return 1.0 / (1.0 + math.exp(-z))
+
+def summarize_draws(draws, years, scenario_label):
+    qs = np.percentile(draws, [10, 25, 50, 75, 90], axis=1)
+    return pd.DataFrame({
+        "Year": years,
+        "Scenario": scenario_label,
+        "p10":  np.round(qs[0], 3),
+        "p25":  np.round(qs[1], 3),
+        "Median": np.round(qs[2], 3),
+        "p75":  np.round(qs[3], 3),
+        "p90":  np.round(qs[4], 3),
+    })
+
+def export_tables(tabs: dict[str, pd.DataFrame]):
+    xlsx = OUT_DIR / "scenario_summaries.xlsx"
+    with pd.ExcelWriter(xlsx) as xw:
+        for name, df in tabs.items():
+            sheet = name.replace(":", "_").replace("/", "_")[:28]
+            df.to_excel(xw, sheet_name=sheet, index=False)
+            csv = OUT_DIR / (sheet.lower().replace(" ", "_") + ".csv")
+            df.to_csv(csv, index=False)
+    return xlsx
+
+def plot_fan(ax, years, draws, label):
+    qs = np.percentile(draws, [10, 25, 50, 75, 90], axis=1)
+    x = np.array(years, dtype=float)
+    ax.fill_between(x, qs[0], qs[4], alpha=0.20)
+    ax.fill_between(x, qs[1], qs[3], alpha=0.30)
+    ax.plot(x, qs[2], marker="o", linewidth=2, label=label)
+    ax.plot(x, qs[0], linestyle="--", linewidth=1.2, alpha=0.7)
+    ax.plot(x, qs[4], linestyle="--", linewidth=1.2, alpha=0.7)
+
+# <<< NEW: small legend showing what the bands mean
+def add_percentile_legend(ax, loc="upper left"):
+    median_line = Line2D([0], [0], linewidth=2, color="black", label="Median")
+    band_1090 = Patch(facecolor="gray", alpha=0.20, edgecolor="none", label="10–90%")
+    band_2575 = Patch(facecolor="gray", alpha=0.30, edgecolor="none", label="25–75%")
+    leg = ax.legend(handles=[median_line, band_1090, band_2575],
+                    loc=loc, frameon=True, title=None)
+    # keep this legend and allow a second legend for scenario labels
+    ax.add_artist(leg)
+
+# ------------------------------plotting ------------------------------
+def plot_pair(years, draws_a, label_a, draws_b, label_b, title, fname):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    plot_fan(ax, years, draws_a, label_a)
+    plot_fan(ax, years, draws_b, label_b)
+
+    add_percentile_legend(ax, loc="upper left")
+
+    # scenario legend (lower-right)
+    ax.set_title(title)
+    ax.set_xlabel("Year"); ax.set_ylabel("Probability")
+    ax.set_xticks(years); ax.grid(True, linestyle=":")
+    ax.legend(loc="lower right", frameon=True)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / fname, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_three_panel(years, base_draws, pol_draws_dict, base_label, title, fname):
+    order = ["strong", "moderate", "mild"]
+    titles = {
+        "strong":   f"{base_label} vs Policy (strong)",
+        "moderate": f"{base_label} vs Policy (moderate)",
+        "mild":     f"{base_label} vs Policy (mild)",
+    }
+    x = np.array(years, dtype=float)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+
+    for ax, key in zip(axes, order):
+        qa = np.percentile(base_draws, [10,25,50,75,90], axis=1)
+        ax.fill_between(x, qa[0], qa[4], alpha=0.20, label="10–90%")
+        ax.fill_between(x, qa[1], qa[3], alpha=0.30, label="25–75%")
+        ax.plot(x, qa[2], marker="o", linewidth=2, label=base_label)
+
+        qb = np.percentile(pol_draws_dict[key], [10,25,50,75,90], axis=1)
+        ax.fill_between(x, qb[0], qb[4], alpha=0.15)
+        ax.fill_between(x, qb[1], qb[3], alpha=0.25)
+        ax.plot(x, qb[2], marker="o", linewidth=2, label=f"Policy ({key})")
+
+        ax.set_title(titles[key]); ax.set_xlabel("Year")
+        ax.set_xticks(years); ax.grid(True, linestyle=":")
+
+        # <<< NEW: percentile legend in each panel
+        add_percentile_legend(ax, loc="upper left")
+
+    axes[0].set_ylabel("Probability")
+    # combined scenario legend (top center)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=5, frameon=True)
+    fig.suptitle(title, y=1.03)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / fname, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+# ------------------------------ Drivers ------------------------------
+DRIVERS_META = {
+    "EV_mileage_share_pct": {"lower_is_better": False},
+    "Value_of_time_business_gbp_per_hr": {"lower_is_better": False},
+    "Marginal_external_cost_p_per_km": {"lower_is_better": True},
+    "Vehicle_occupancy": {"lower_is_better": False},
+    "EV_kwh_per_100km": {"lower_is_better": True},
+    "EV_cost_p_per_km": {"lower_is_better": True},
+    "Public_concern_pct": {"lower_is_better": True},
+    "Experience_pct": {"lower_is_better": False},
+    "Coverage_total_pct": {"lower_is_better": False},
+    "Awareness_pct": {"lower_is_better": False},
+}
+
+def pick_present_drivers(df):
+    return [c for c in DRIVERS_META if c in df.columns]
+
+def compute_thresholds(df, drivers):
+    return {c: float(np.nanmedian(df[c].values)) for c in drivers}
+
+def binarize_df(df, drivers, thresholds):
+    out = {}
+    for c in drivers:
+        good_when_low = DRIVERS_META[c]["lower_is_better"]
+        thr = thresholds[c]
+        out[c + "_High"] = (df[c] <= thr).astype(int) if good_when_low else (df[c] >= thr).astype(int)
+    return pd.DataFrame(out)
+
+def learn_weights(df, drivers, target="AdoptionPct"):
+    y = df[target].astype(float).values
+    corrs = {}
+    for c in drivers:
+        x = df[c].astype(float).values
+        corr = float(np.corrcoef(x, y)[0, 1])
+        if DRIVERS_META[c]["lower_is_better"]:
+            corr = -corr
+        corrs[c] = corr
+    denom = sum(abs(v) for v in corrs.values()) or 1.0
+    named = {c: corrs[c] / denom for c in drivers}
+    return {c + "_High": ALPHA * named[c] for c in drivers}
+
+def apply_overrides(df, overrides: dict | None):
+    if not overrides:
+        return df.copy()
+    out = df.copy()
+    for col, seq in overrides.items():
+        if col in out.columns:
+            if len(seq) != len(out):
+                raise ValueError(f"Override for {col}: length {len(seq)} != {len(out)}")
+            out[col] = list(seq)
+    return out
+
+# ------------------------------ Policy builder ------------------------------
+def make_policy_data(base_df, strength="moderate", extra_overrides=None):
+    df = base_df.copy()
+    if "Public_concern_pct" in df.columns:
+        df["Public_concern_pct"] = {
+            "mild":     [80, 70, 60, 45, 30, 18, 11, 7],
+            "moderate": [75, 60, 45, 30, 18, 10, 6, 3],
+            "strong":   [70, 40, 30, 20, 12, 7, 5, 3],
+        }[strength]
+    if "Experience_pct" in df.columns:
+        df["Experience_pct"] = {
+            "mild":     [52, 62, 74, 86, 93, 97, 99, 99.5],
+            "moderate": [55, 68, 82, 92, 97, 99, 99.5, 99.7],
+            "strong":   [70, 75, 88, 96, 99, 99.7, 99.9, 99.9],
+        }[strength]
+    if "Coverage_total_pct" in df.columns:
+        df["Coverage_total_pct"] = {
+            "mild":     [70, 86, 94, 99, 99, 99, 99, 99],
+            "moderate": [75, 90, 96, 99, 99, 99, 99, 99],
+            "strong":   [90, 92, 97, 99, 99, 99, 99, 99],
+        }[strength]
+    if "Awareness_pct" in df.columns:
+        df["Awareness_pct"] = {
+            "mild":     [86, 90, 94, 97.5, 99.0, 99.5, 99.7, 99.8],
+            "moderate": [88, 93, 96, 98.5, 99.5, 99.8, 99.9, 99.9],
+            "strong":   [90, 95, 98, 99.5, 99.8, 99.9, 99.9, 99.9],
+        }[strength]
+    if extra_overrides:
+        df = apply_overrides(df, extra_overrides)
+    return df
+
+# ------------------------------ DBN CPDs (logistic link) ------------------------------
+def logistic_cpt_probs(parents, W, bias, w_prev):
+    cols_parent = list(product([0, 1], repeat=len(parents)))
+    p_t0 = []
+    for s in cols_parent:
+        z = bias + sum(W[p] * si for p, si in zip(parents, s))
+        p_t0.append(sigmoid(z))
+    p_t1 = []
+    for s in cols_parent:
+        for prev_ in [0, 1]:
+            z = bias + w_prev * prev_ + sum(W[p] * si for p, si in zip(parents, s))
+            p_t1.append(sigmoid(z))
+    return np.asarray(p_t0), np.asarray(p_t1)
+
+def sample_bernoulli_cpt_from_beta(p_cols, phi):
+    p = np.clip(np.asarray(p_cols, dtype=float), 1e-6, 1 - 1e-6)
+    alpha = phi * p
+    beta = phi * (1.0 - p)
+    p1 = np.random.beta(alpha, beta)
+    return np.vstack([1.0 - p1, p1]) 
+
+def make_sampled_adoption_cpds(parents, W, bias, w_prev, phi):
+    p_t0, p_t1 = logistic_cpt_probs(parents, W, bias, w_prev)
+    cpd0 = TabularCPD(('AdoptionHigh', 0), 2,
+                      sample_bernoulli_cpt_from_beta(p_t0, phi),
+                      evidence=[(p, 0) for p in parents],
+                      evidence_card=[2] * len(parents))
+    cpd1 = TabularCPD(('AdoptionHigh', 1), 2,
+                      sample_bernoulli_cpt_from_beta(p_t1, phi),
+                      evidence=[(p, 1) for p in parents] + [('AdoptionHigh', 0)],
+                      evidence_card=[2] * len(parents) + [2])
+    return cpd0, cpd1
+
+def build_dbn_with_given_cpds(parents, cpd0, cpd1):
+    def prior(var, t, p1=0.5):
+        return TabularCPD((var, t), 2, [[1 - p1], [p1]])
+    model = DBN()
+    model.add_nodes_from(['AdoptionHigh'] + parents)
+    for t in [0, 1]:
+        model.add_edges_from([((p, t), ('AdoptionHigh', t)) for p in parents])
+    model.add_edge(('AdoptionHigh', 0), ('AdoptionHigh', 1))
+    model.add_cpds(cpd0, cpd1,
+                   *[prior(p, 0) for p in parents],
+                   *[prior(p, 1) for p in parents])
+    model.initialize_initial_state()
+    model.check_model()
+    return model
+
+def posterior_predictive_draws(parents, W, bias, w_prev,
+                               years, X_base, X_pol_dict,
+                               phi=PHI, n_sims=N_SIMS):
+    n_years = len(years)
+    base_draws = np.zeros((n_years, n_sims))
+    pol_draws = {k: np.zeros((n_years, n_sims)) for k in X_pol_dict}
+    for s in range(n_sims):
+        cpd0, cpd1 = make_sampled_adoption_cpds(parents, W, bias, w_prev, phi)
+        dbn = build_dbn_with_given_cpds(parents, cpd0, cpd1)
+        inf = DBNInference(dbn)
+        def ev_from_row(X, i, t): return {(p, t): int(X.iloc[i][p]) for p in parents}
+        # baseline path
+        for i in range(n_years):
+            if i == 0:
+                q = inf.query([('AdoptionHigh', 0)], evidence=ev_from_row(X_base, 0, 0))
+                base_draws[i, s] = q[('AdoptionHigh', 0)].values[1]
+            else:
+                ev = {**ev_from_row(X_base, i - 1, 0), **ev_from_row(X_base, i, 1)}
+                q = inf.query([('AdoptionHigh', 1)], evidence=ev)
+                base_draws[i, s] = q[('AdoptionHigh', 1)].values[1]
+        # policy paths
+        for name, X_pol in X_pol_dict.items():
+            for i in range(n_years):
+                if i == 0:
+                    q = inf.query([('AdoptionHigh', 0)], evidence=ev_from_row(X_pol, 0, 0))
+                    pol_draws[name][i, s] = q[('AdoptionHigh', 0)].values[1]
+                else:
+                    ev = {**ev_from_row(X_pol, i - 1, 0), **ev_from_row(X_pol, i, 1)}
+                    q = inf.query([('AdoptionHigh', 1)], evidence=ev)
+                    pol_draws[name][i, s] = q[('AdoptionHigh', 1)].values[1]
+    return base_draws, pol_draws
+
+# ------------------------------ Runner (Baseline, Forecast, Policies) ------------------------------
+def run_all_scenarios(data: pd.DataFrame, predicted_overrides: dict | None = None):
+    years = list(data["Year"])
+    drivers = pick_present_drivers(data)
+    if not drivers:
+        raise ValueError("No recognized driver columns found in data.")
+    thresholds = compute_thresholds(data, drivers)
+
+    X_base = binarize_df(data, drivers, thresholds)
+    parents = [c + "_High" for c in drivers]
+    W = learn_weights(data, drivers)
+    bias = logit(float((data["AdoptionPct"] >= TARGET_THRESHOLD).mean()))
+    w_prev = W_PREV
+
+    results = {}
+    summaries = {}
+
+    # --- Baseline ---
+    base_draws, _ = posterior_predictive_draws(
+        parents, W, bias, w_prev, years, X_base, X_pol_dict={}, phi=PHI, n_sims=N_SIMS
+    )
+    results["Baseline"] = base_draws
+    summaries["Baseline"] = summarize_draws(base_draws, years, "Baseline")
+
+    # --- Forecast + Policies---
+    if predicted_overrides:
+        df_fore = apply_overrides(data, predicted_overrides)
+        X_fore = binarize_df(df_fore, drivers, thresholds)
+        pol_dict_frames = {s: binarize_df(make_policy_data(df_fore, s), drivers, thresholds)
+                           for s in POLICY_STRENGTHS}
+        fore_draws, pol_draws = posterior_predictive_draws(
+            parents, W, bias, w_prev, years, X_fore, pol_dict_frames, phi=PHI, n_sims=N_SIMS
+        )
+        results["Forecast"] = fore_draws
+        summaries["Forecast"] = summarize_draws(fore_draws, years, "Forecast")
+        for s in POLICY_STRENGTHS:
+            label = f"Forecast + Policy ({s})"
+            results[label] = pol_draws[s]
+            summaries[label] = summarize_draws(pol_draws[s], years, label)
+        base_label_for_pairs = "Forecast"
+        pair_source_draws = fore_draws
+        pair_targets = {s: pol_draws[s] for s in POLICY_STRENGTHS}
+    else:
+        pol_dict_frames = {s: binarize_df(make_policy_data(data, s), drivers, thresholds)
+                           for s in POLICY_STRENGTHS}
+        _, pol_draws = posterior_predictive_draws(
+            parents, W, bias, w_prev, years, X_base, pol_dict_frames, phi=PHI, n_sims=N_SIMS
+        )
+        for s in POLICY_STRENGTHS:
+            label = f"Baseline + Policy ({s})"
+            results[label] = pol_draws[s]
+            summaries[label] = summarize_draws(pol_draws[s], years, label)
+        base_label_for_pairs = "Baseline"
+        pair_source_draws = base_draws
+        pair_targets = {s: pol_draws[s] for s in POLICY_STRENGTHS}
+
+    # --- ALL scenarios overlay ---
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for name, draws in results.items():
+        plot_fan(ax, years, draws, name)
+    add_percentile_legend(ax, loc="upper left")
+
+    # scenario legend in lower-right
+    ax.set_title("P(High CAV Adoption) — Baseline / Forecast / Policies (DBN)")
+    ax.set_xlabel("Year"); ax.set_ylabel("Probability")
+    ax.set_xticks(years); ax.grid(True, linestyle=":"); ax.legend(loc="lower right", frameon=True)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "fanchart_all_scenarios_dbn.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # --- three pairwise plots ---
+    plot_pair(years, pair_source_draws, base_label_for_pairs,
+              pair_targets["strong"], f"Policy (strong)",
+              f"P(High CAV Adoption) — {base_label_for_pairs} vs Policy (strong)",
+              "pair_vs_strong.png")
+    plot_pair(years, pair_source_draws, base_label_for_pairs,
+              pair_targets["moderate"], f"Policy (moderate)",
+              f"P(High CAV Adoption) — {base_label_for_pairs} vs Policy (moderate)",
+              "pair_vs_moderate.png")
+    plot_pair(years, pair_source_draws, base_label_for_pairs,
+              pair_targets["mild"], f"Policy (mild)",
+              f"P(High CAV Adoption) — {base_label_for_pairs} vs Policy (mild)",
+              "pair_vs_mild.png")
+
+    # --- one figure with 3 panels 
+    plot_three_panel(years, pair_source_draws, pair_targets,
+                     base_label_for_pairs,
+                     "P(High CAV Adoption) — Pairwise comparisons",
+                     "three_panel_pairs.png")
+
+    export_tables(summaries)
+    return results, summaries, parents, thresholds
+
+# ------------------------------ Baseline Data (ALL drivers included) ------------------------------
+def build_baseline_df():
+    years = [2025, 2030, 2035, 2040, 2045, 2050, 2055, 2060]
+    return pd.DataFrame({
+        "Year": years,
+        "AdoptionPct": [0.00, 4.55, 9.09, 22.00, 41.67, 65.00, 82.50, 91.50],
+
+        # Core drivers (your tables)
+        "EV_mileage_share_pct": [13.36, 40.73, 69.88, 87.80, 96.43, 99.07, 99.07, 99.07],
+        "Value_of_time_business_gbp_per_hr": [18.42, 19.98, 21.57, 23.32, 25.01, 26.68, 28.45, 30.42],
+        "Marginal_external_cost_p_per_km": [27.60, 32.60, 38.10, 46.44, 55.90, 67.36, 77.96, 87.35],
+        "Vehicle_occupancy": [1.562, 1.551, 1.540, 1.509, 1.462, 1.406, 1.363, 1.342],
+        "EV_kwh_per_100km": [19.21, 17.75, 16.93, 16.35, 15.85, 15.43, 15.43, 15.43],
+        "EV_cost_p_per_km": [4.302, 3.967, 3.494, 3.309, 3.209, 3.123, 3.123, 3.123],
+
+        # Policy levers (baseline/no-policy paths)
+        "Public_concern_pct": [85, 82, 78, 70, 60, 50, 45, 40],
+        "Experience_pct":      [40, 45, 50, 60, 70, 80, 85, 90],
+        "Coverage_total_pct":  [60, 70, 80, 90, 95, 97, 98, 99],
+        "Awareness_pct":       [70, 75, 80, 85, 90, 94, 96, 97.5],
+    })
+
+# ------------------------------ Run as script ------------------------------
+if __name__ == "__main__":
+    data = build_baseline_df()
+    predicted_overrides = {
+        # optionally override some series for a Forecast: for further studies 
+        # "EV_mileage_share_pct": [14.0, 42.0, 70.0, 88.0, 96.0, 98.0, 99.0, 99.5],
+        # "EV_kwh_per_100km":     [19.0, 17.2, 16.4, 15.9, 15.4, 15.1, 14.9, 14.7],
+        # "EV_cost_p_per_km":     [4.20, 3.85, 3.40, 3.20, 3.05, 3.00, 2.95, 2.90],
+    }
+    results, summaries, parents, thresholds = run_all_scenarios(
+        data,
+        predicted_overrides=predicted_overrides if len(predicted_overrides) else None
+    )
+    print("Parents (drivers used):", parents)
+    print("Thresholds:", {k: round(v, 3) for k, v in thresholds.items()})
+    print(f"Outputs saved in: {OUT_DIR.resolve()}")
